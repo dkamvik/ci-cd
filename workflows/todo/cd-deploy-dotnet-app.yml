@@ -1,0 +1,454 @@
+name: CD Deploy Workflow
+
+on:
+  workflow_call:
+    inputs:
+      params:
+        description: 'Parameters for deployment configuration in Json format'
+        required: true
+        type: string
+    secrets:
+      GH_TOKEN:
+        description: 'GitHub token for downloading release artifacts'
+        required: true
+
+env:
+  DEPLOY_DIR: deploy
+  BACKUP_RETENTION_COUNT: 3
+  WWWROOT_BASE: D:\wwwroot
+
+jobs:
+  deploy:
+    runs-on:
+      - self-hosted
+      - ${{ fromJson(inputs.params).env_name }}
+    environment: ${{ fromJson(inputs.params).env_name }}
+    
+    outputs:
+      release-url: ${{ steps.summary.outputs.release-url }}
+      release-version: ${{ steps.parameters.outputs.ver_number }}
+
+    steps:
+      - name: Parse input parameters
+        id: parameters
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          try {
+            $params = '${{ inputs.params }}' | ConvertFrom-Json 
+            
+            # Validate required parameters
+            $requiredParams = @('app_name', 'web_name', 'env_name', 'ver_number', 'dir_name', 'app_pool')
+            foreach ($param in $requiredParams) {
+              if (-not $params.$param) {
+                throw "Required parameter '$param' is missing or empty"
+              }
+            }
+
+            $skipItems = @()
+            if ($params.PSObject.Properties.Name -contains 'skip_items' -and $params.skip_items) {
+                $skipItems = $params.skip_items -split ',' | 
+                    ForEach-Object { $_.Trim() } | 
+                    Where-Object { -not [string]::IsNullOrEmpty($_) }
+            }
+            
+            # Set outputs with validation
+            @{
+              app_name = $params.app_name
+              web_name = $params.web_name
+              api_name = $params.api_name ?? ""
+              env_name = $params.env_name
+              ver_number = $params.ver_number
+              dir_name = $params.dir_name
+              app_pool = $params.app_pool
+              skip_items = ($skipItems -join ',')
+              web_only = [bool]($params.web_only -eq "true" -or $params.web_only -eq $true)
+            }.GetEnumerator() | ForEach-Object {
+              "$($_.Key)=$($_.Value)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            }
+
+            Write-Host "Parameters parsed successfully"
+          }
+          catch {
+            Write-Error "Parameter parsing failed: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Print deployment context
+        shell: pwsh
+        run: |
+          Write-Host "Deployment  Context:" -ForegroundColor Cyan
+          Write-Host "  Branch: ${{ github.ref_name }}" -ForegroundColor White
+          Write-Host "  Triggered by: ${{ github.actor }}" -ForegroundColor White
+          Write-Host "  Event: ${{ github.event_name }}" -ForegroundColor White
+          Write-Host "  Version: ${{ steps.parameters.outputs.ver_number }}" -ForegroundColor White
+          Write-Host "  Environment: ${{ steps.parameters.outputs.env_name }}" -ForegroundColor White
+          Write-Host "  Web Only: ${{ steps.parameters.outputs.web_only }}" -ForegroundColor White
+
+      - name: Download release artifact
+        id: download
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          try {
+            $repo = "${{ github.repository }}"
+            $version = "${{ steps.parameters.outputs.ver_number }}"
+            $downloadDir = "${{ env.DEPLOY_DIR }}"
+            
+            Write-Host "Downloading release artifact for version: $version"
+            
+            # Clean download directory
+            if (Test-Path $downloadDir) {
+              Remove-Item -Path "$downloadDir\*" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
+            
+            # Download release
+            gh release download $version --repo $repo --pattern "*.zip" --dir $downloadDir --clobber
+            
+            # Verify download
+            $downloadedFiles = Get-ChildItem -Path $downloadDir -Filter "*.zip"
+            if ($downloadedFiles.Count -eq 0) {
+              throw "No zip files found after download"
+            }         
+
+            Write-Host "Release artifact downloaded successfully"
+          }
+          catch {
+            Write-Error "Failed to download release artifact: $($_.Exception.Message)"
+            exit 1
+          }
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Extract release package
+        id: extract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          try {
+            $version = "${{ steps.parameters.outputs.ver_number }}"
+            $cleanVersion = $version.TrimStart("v")
+            $appName = "${{ steps.parameters.outputs.app_name }}"
+            $webName = "${{ steps.parameters.outputs.web_name }}"
+            $apiName = "${{ steps.parameters.outputs.api_name }}"
+            $dirName = "${{ steps.parameters.outputs.dir_name }}"
+            $webOnly = "${{ steps.parameters.outputs.web_only }}" -ieq "true"
+
+            $zipPath = "${{ env.DEPLOY_DIR }}\$appName.$cleanVersion.zip"
+            $extractPath = "${{ env.DEPLOY_DIR }}\temp-extract\$dirName"
+            
+            Write-Host "Extracting release package"
+            
+            # Clean and create extraction directory
+            if (Test-Path $extractPath) {
+              Remove-Item -Recurse -Force $extractPath
+            }
+            New-Item -ItemType Directory -Force -Path $extractPath | Out-Null
+            
+            # Extract archive
+            if (-not (Test-Path $zipPath)) {
+              throw "Zip file not found: $zipPath"
+            }
+            Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+            
+            # Process web folder
+            $webFolder = Get-ChildItem $extractPath -Directory | Where-Object { $_.Name -eq $webName }
+            if (-not $webFolder) {
+              throw "Web folder '$webName' not found in the archive"
+            }
+            Remove-Item "$($webFolder.FullName)\web.config" -Force -ErrorAction SilentlyContinue
+            
+            # Process API folder (if applicable)
+            if (-not $webOnly) {             
+              $apiFolder = Get-ChildItem $extractPath -Directory | Where-Object { $_.Name -eq $apiName }
+              if (-not $apiFolder) {
+                throw "API folder '$apiName' not found in the archive"
+              }
+              Remove-Item "$($apiFolder.FullName)\web.config" -Force -ErrorAction SilentlyContinue             
+            }  
+
+            Write-Host "Extraction completed successfully"
+          }
+          catch {
+            Write-Error "Extraction failed: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Create deployment backup
+        id: backup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          try {
+            $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+            $envName = "${{ steps.parameters.outputs.env_name }}"
+            $dirName = "${{ steps.parameters.outputs.dir_name }}"
+            $webOnly = "${{ steps.parameters.outputs.web_only }}" -ieq "true"
+
+            $webSourcePath = "${{ env.WWWROOT_BASE }}\$envName\$dirName"
+            $backupDir = "${{ env.WWWROOT_BASE }}\backup\$dirName"
+            $backupPath = Join-Path $backupDir "backup-$timestamp"
+            
+            if (-not (Test-Path $backupDir)) {
+              New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+            }
+
+            Write-Host "Creating backup of existing deployment"   
+            if (Test-Path $webSourcePath) {
+              $webTargetPath = Join-Path $backupPath $dirName
+              Copy-Item -Path $webSourcePath -Destination $webTargetPath -Recurse -Force
+
+              if (-not $webOnly) {
+                $apiSourcePath = "$($webSourcePath)api"
+                $apiTargetPath = Join-Path $backupPath "$($dirName)api"
+                Copy-Item -Path $apiSourcePath -Destination $apiTargetPath -Recurse -Force
+              }
+
+              Write-Host "Backup created successfully"
+              
+              # Clean old backups
+              $oldBackups = Get-ChildItem -Path $backupDir -Filter "backup-*" | Sort-Object LastWriteTime -Descending
+              
+              if ($oldBackups.Count -gt ${{ env.BACKUP_RETENTION_COUNT }}) {
+                $toDelete = $oldBackups | Select-Object -Skip ${{ env.BACKUP_RETENTION_COUNT }}
+                $toDelete | ForEach-Object {
+                  Remove-Item -Path $_.FullName -Recurse -Force
+                }
+                Write-Host "Old backups cleaned up. Kept the latest $(${{ env.BACKUP_RETENTION_COUNT }}) backups."
+              }
+            } else {
+              Write-Host "No existing deployment found; skipping backup"
+            }
+          }
+          catch {
+            Write-Error "Backup creation failed: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Stop application pools
+        id: stop-pools
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          try {
+            Import-Module WebAdministration 
+            
+            $envName = "${{ steps.parameters.outputs.env_name }}"
+            $appPool = "${{ steps.parameters.outputs.app_pool }}"
+            $webOnly = "${{ steps.parameters.outputs.web_only }}" -ieq "true"
+
+            $webPoolName = "$envName-$appPool"
+            $apiPoolName = "$envName-${appPool}API"
+            
+            Write-Host "Stopping application pool(s)..."
+            
+            # Function to safely stop app pool
+            function Stop-AppPoolSafely {
+              param([string]$PoolName, [string]$PoolType)
+
+              $appPoolPath = "IIS:\AppPools\$PoolName"              
+              if (Test-Path $appPoolPath) {
+                $state = (Get-WebAppPoolState $PoolName).Value
+                if ($state -ne 'Stopped') {
+                  Stop-WebAppPool -Name $PoolName
+                  
+                  # Wait for pool to stop (max 30 seconds)
+                  $timeout = 30
+                  do {
+                    Start-Sleep -Seconds 1
+                    $timeout--
+                    $currentState = (Get-WebAppPoolState $PoolName).Value
+                  } while ($currentState -ne 'Stopped' -and $timeout -gt 0)
+                  
+                  if ($timeout -eq 0) {
+                    Write-Warning "Timeout waiting for pool to stop"
+                  } else {
+                    Write-Host "$($poolType) application pool stopped successfully"
+                  }
+                } else {
+                  Write-Host "$($poolType) application pool is already stopped"
+                }
+              } else {
+                Write-Warning "$($poolType) application pool $PoolName not found"
+              }
+            }
+            
+            Stop-AppPoolSafely -PoolName $webPoolName -PoolType "Web"
+            
+            if (-not $webOnly) {  
+              Stop-AppPoolSafely -PoolName $apiPoolName -PoolType "Api"
+            }
+          }
+          catch {
+            Write-Error "Failed to stop application pools: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Deploy application files
+        id: deploy-files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          try {
+            $envName = "${{ steps.parameters.outputs.env_name }}"
+            $dirName = "${{ steps.parameters.outputs.dir_name }}"
+            $webName = "${{ steps.parameters.outputs.web_name }}"
+            $apiName = "${{ steps.parameters.outputs.api_name }}"
+            $webOnly = "${{ steps.parameters.outputs.web_only }}" -ieq "true"
+            $skipItems = "${{ steps.parameters.outputs.skip_items }}".Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+            
+            $extractPath = "${{ env.DEPLOY_DIR }}\temp-extract\$dirName"
+            $webDeployPath = "${{ env.WWWROOT_BASE }}\$envName\$dirName"
+            $apiDeployPath = "$($webDeployPath)api"
+            
+            Write-Host "Deploying application files..." 
+            
+            # Function to safely clean directory 
+            function Clear-DeploymentPath {
+              param($Path)
+             
+              if (Test-Path $Path) {
+                  Get-ChildItem $Path | Where-Object { 
+                  $item = $_
+                  -not ($skipItems | Where-Object { $item.Name -ieq $_ })
+                } | Remove-Item -Recurse -Force
+              } else {
+                  New-Item -ItemType Directory -Force -Path $Path | Out-Null
+              }
+            }
+            
+            # Deploy web application
+            Clear-DeploymentPath -Path $webDeployPath
+            $webSourcePath = Get-ChildItem $extractPath -Directory | Where-Object { $_.Name -eq $webName }
+            if (-not $webSourcePath) {
+              throw "Web source folder not found: $webName"
+            } 
+            Get-ChildItem $webSourcePath.FullName | Move-Item -Destination $webDeployPath -Force            
+            
+            # Deploy API application (if applicable)
+            if (-not $webOnly) {
+              Clear-DeploymentPath -Path $apiDeployPath
+              $apiSourcePath = Get-ChildItem $extractPath -Directory | Where-Object { $_.Name -eq $apiName }
+              if (-not $apiSourcePath) {
+                throw "API source folder not found: $apiName"                
+              } 
+              Get-ChildItem $apiSourcePath.FullName | Move-Item -Destination $apiDeployPath -Force
+            }
+            
+            Write-Host "Application deployment completed successfully"
+          }
+          catch {
+            Write-Error "Application deployment failed: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Start application pools
+        id: start-pools
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          try {
+            Import-Module WebAdministration 
+            
+            $envName = "${{ steps.parameters.outputs.env_name }}"
+            $appPool = "${{ steps.parameters.outputs.app_pool }}"
+            $webOnly = "${{ steps.parameters.outputs.web_only }}" -ieq "true"
+
+            $webPoolName = "$envName-$appPool"
+            $apiPoolName = "$envName-${appPool}API"
+            
+            Write-Host "Starting application pool(s)..." 
+            
+            # Function to safely start app pool
+            function Start-AppPoolSafely {
+              param([string]$PoolName, [string]$PoolType)
+              
+              $appPoolPath = "IIS:\AppPools\$PoolName"              
+              if (Test-Path $appPoolPath) {
+                $state = (Get-WebAppPoolState $PoolName).Value
+                if ($state -eq 'Stopped') {
+                  Start-WebAppPool -Name $PoolName
+                  
+                  # Wait for pool to start (max 30 seconds)
+                  $timeout = 30
+                  do {
+                    Start-Sleep -Seconds 1
+                    $timeout--
+                    $currentState = (Get-WebAppPoolState $PoolName).Value
+                  } while ($currentState -ne 'Started' -and $timeout -gt 0)
+                  
+                  if ($timeout -eq 0) {
+                    Write-Warning "Timeout waiting for pool to start"
+                  } else {
+                    Write-Host "$poolType application pool started successfully"
+                  }
+                } else {
+                  Write-Host "$poolType application pool is already running"
+                }
+              } else {
+                Write-Warning "$poolType application pool $PoolName not found"
+              }
+            }
+            
+            Start-AppPoolSafely -PoolName $webPoolName -PoolType "Web"
+            
+            if (-not $webOnly) {
+              Start-AppPoolSafely -PoolName $apiPoolName -PoolType "Api"
+            }
+          }
+          catch {
+            Write-Error "Failed to start application pools: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Cleanup temporary files
+        if: always()
+        shell: pwsh
+        run: |
+          try {
+            $deployDir = "${{ env.DEPLOY_DIR }}"
+            if (Test-Path $deployDir) {
+              Remove-Item -Path $deployDir -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "Temporary deployment files cleaned up"
+            }
+          }
+          catch {
+            Write-Warning "Failed to cleanup temporary files: $($_.Exception.Message)"
+          }
+
+      - name: Print deployment summary
+        id: summary
+        shell: pwsh
+        run: |
+          $version = "${{ steps.parameters.outputs.ver_number }}"
+          $environment = "${{ steps.parameters.outputs.env_name }}".ToUpper()
+          $repo = "${{ github.repository }}"
+          $branch = "${{ github.ref_name }}"
+          $releaseUrl = "https://github.com/$repo/releases/tag/$version"
+          $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
+          
+          Write-Host ""
+          Write-Host "Deployment Summary" 
+          Write-Host "=====================" 
+          Write-Host "Version: $version" 
+          Write-Host "Environment: $environment" 
+          Write-Host "Release URL: $releaseUrl" 
+          Write-Host "Deployed by: ${{ github.actor }}" 
+          Write-Host ""
+          
+          # Set step outputs
+          "release-url=$releaseUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          
+          # GitHub Actions notices
+          Write-Host "##[notice title=Release]$releaseUrl"
+          Write-Host "##[notice title=Environment]$environment"
+          Write-Host "##[notice title=Version]$version"
+          Write-Host "##[notice title=Branch]$branch"

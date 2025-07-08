@@ -1,0 +1,16 @@
+name: 'Custom MSBuild Setup'
+description: 'A wrapper action to set up MSBuild environment using microsoft/setup-msbuild@v2.'
+
+inputs: 
+  msbuild-version:
+    description: 'The Visual Studio / MSBuild version to install. For example, 16.0 or 2019.'
+    required: false
+    default: '' 
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run microsoft/setup-msbuild
+      uses: microsoft/setup-msbuild@v2
+      with:
+        msbuild-version: ${{ inputs.msbuild-version }}      

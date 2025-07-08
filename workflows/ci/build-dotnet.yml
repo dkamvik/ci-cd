@@ -1,0 +1,407 @@
+name: CI Build Workflow
+
+on:
+  workflow_call:
+    inputs:
+      params:
+        description: 'Build configuration parameters in JSON format'
+        required: true
+        type: string
+    secrets:
+      GH_TOKEN:
+        description: 'GitHub token for publishing release artifacts'
+        required: true
+
+env:
+  BUILD_CONFIGURATION: Release
+  DEPLOY_DIR: deploy
+  PACKAGE_TEMP_DIR: deploy/_package_temp
+
+jobs:
+  validate-inputs:
+    name: 'Validate Inputs'
+    runs-on: windows-latest
+    outputs:
+      inputParams: ${{ steps.parameters.outputs.inputParams }}
+      solutionExists: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Parse input params
+        id: parameters
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"          
+          try {
+            $params = '${{ inputs.params }}' | ConvertFrom-Json            
+            # Required parameters validation
+            $requiredParams = @('app_name', 'web_name', 'solution_name')
+            $missingParams = $requiredParams | Where-Object { -not $params.$_ }            
+            if ($missingParams) {
+              throw "Missing required parameters: $($missingParams -join ', ')"
+            }
+
+            # Parse and validate configuration
+            $inputs = @{
+              appName = $params.app_name.Trim()
+              webName = $params.web_name.Trim()
+              apiName = ($params.api_name ?? "").Trim()
+              solutionName = $params.solution_name.Trim()
+              webOnly = [bool]($params.web_only -eq "true" -or $params.web_only -eq $true)
+            }
+            
+            # Set outputs
+            "inputParams=$inputs" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            
+            Write-Host "Build parameters parsed successfully" -ForegroundColor Green
+            Write-Host "  App: $($config.app_name)"
+            Write-Host "  Web: $($config.web_name)"
+            Write-Host "  API: $($config.api_name)"
+            Write-Host "  Solution: $($config.solution_name)"
+            Write-Host "  Web Only: $($config.web_only)"
+          }
+          catch {
+            Write-Error "Parameter parsing failed: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Check solution exists
+        id: check
+        shell: pwsh
+        run: |
+          if (Test-Path "${{ steps.parameters.outputs.inputParams.solutionName }}") {
+            "exists=true" | Out-File -Append $env:GITHUB_OUTPUT
+            Write-Host "Found solution file"
+          } else {
+            "exists=false" | Out-File -Append $env:GITHUB_OUTPUT
+            Write-Host "Solution file not found"
+            exit 1
+          }
+
+  build:
+    name: 'Build Solution'
+    runs-on: windows-latest
+    needs: validate-inputs
+    if: needs.validate-inputs.outputs.solutionExists == 'true'
+    outputs:
+      version: ${{ steps.version.outputs.version }}  
+      release-tag: ${{ steps.version.outputs.release-tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup build environment
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Restore project dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"          
+          try {
+            Write-Host "Starting NuGet package restore..."
+            nuget restore "${{ needs.validate-inputs.outputs.solutionName }}"
+            Write-Host "NuGet package restore completed."
+          }
+          catch {
+            Write-Error "Package restoration failed: $($_.Exception.Message)"
+            exit 1
+          }   
+
+      - name: Apply build version
+        id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"          
+          try {
+            Write-Host "Applying build version..."
+            
+            $buildDate = Get-Date
+            $version = @{
+              major = $buildDate.ToString("yy")
+              minor = $buildDate.ToString("MM")  
+              patch = $buildDate.ToString("dd")
+              build = "{0:D4}" -f ([int]${{ github.run_number }} + 1000)
+            }
+            
+            $semanticVersion = "$($version.major).$($version.minor).$($version.patch).$($version.build)"
+            $releaseTag = "v$semanticVersion"
+            
+            # Set outputs
+            "version=$semanticVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "release-tag=$releaseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+         
+            $files = Get-ChildItem -Path . -Recurse -Filter AssemblyInfo.cs
+            foreach ($file in $files) {
+              $content = Get-Content $file.FullName
+              $content = $content -replace 'AssemblyVersion\(".*?"\)', "AssemblyVersion(`"$semanticVersion`")"
+              $content = $content -replace 'AssemblyFileVersion\(".*?"\)', "AssemblyFileVersion(`"$semanticVersion`")"
+              $content | Set-Content $file.FullName
+            }
+
+            Write-Host "  Version: $semanticVersion"
+            Write-Host "  Tag: $releaseTag"    
+            Write-Host "Assembly version update completed."
+          }
+          catch {
+            Write-Error "Failed to apply build version: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Compile solution
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"          
+          try {
+            $config = @{
+              solution = "${{ needs.validate-inputs.outputs.solutionName }}"
+              configuration = "${{ env.BUILD_CONFIGURATION }}"
+              appName = "${{ needs.validate-inputs.outputs.appName }}"
+              version = "${{ steps.version.outputs.version }}"
+            }
+            
+            Write-Host "Compiling solution" -ForegroundColor Yellow
+            Write-Host "  Solution: $($config.solution)"
+            Write-Host "  Configuration: $($config.configuration)"
+            Write-Host "  Output Path: build\$($config.appName)"
+            
+            # Build with MSBuild
+            $buildArgs = @(
+              $config.solution
+              "/p:Configuration=$($config.configuration)"
+              "/p:OutputPath=build\$($config.appName)"
+              "/p:Version=$($config.version)"
+              "/p:AssemblyVersion=$($config.version)"
+              "/p:FileVersion=$($config.version)"
+              "/p:InformationalVersion=$($config.version)"
+              "/m"  # Multi-processor build
+              "/nologo"
+              "/verbosity:minimal"
+            )            
+            Write-Host "  Command: msbuild $($buildArgs -join ' ')"            
+            & msbuild @buildArgs            
+            if ($LASTEXITCODE -ne 0) {
+              throw "MSBuild failed with exit code $LASTEXITCODE"
+            }            
+            Write-Host "Solution compiled successfully" -ForegroundColor Green
+          }
+          catch {
+            Write-Error "Compilation failed: $($_.Exception.Message)"
+            Write-Host "Compilation arguments used:"
+            $buildArgs | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+
+      - name: Package deployment artifacts
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"          
+          try {
+            $config = @{
+              appName = "${{ needs.validate-inputs.outputs.appName }}"
+              webName = "${{ needs.validate-inputs.outputs.webName }}"
+              apiName = "${{ needs.validate-inputs.outputs.apiName }}"
+              version = "${{ steps.version.outputs.version }}"
+              webOnly = "${{ needs.validate-inputs.outputs.webOnly }}" -ieq "true"
+            }
+            
+            $paths = @{
+              deployDir = "${{ env.DEPLOY_DIR }}"
+              tempDir = "${{ env.PACKAGE_TEMP_DIR }}"
+              zipFile = "${{ env.DEPLOY_DIR }}\$($config.appName).$($config.version).zip"
+              webSource = "$($config.webName)\build\$($config.appName)\_PublishedWebsites\$($config.webName)"
+              apiSource = "$($config.apiName)\build\$($config.appName)\_PublishedWebsites\$($config.apiName)"
+            }
+            
+            Write-Host "Creating deployment package" -ForegroundColor Yellow
+            Write-Host "  Package: $($config.appName).$($config.version).zip"
+            
+            # Prepare directories
+            New-Item -ItemType Directory -Force -Path $paths.deployDir | Out-Null
+            if (Test-Path $paths.tempDir) { 
+              Remove-Item $paths.tempDir -Recurse -Force 
+            }
+            New-Item -ItemType Directory -Force -Path $paths.tempDir | Out-Null
+            
+            function Add-ApplicationToPackage {
+              param([string]$SourcePath, [string]$AppType, [string]$Version)
+              
+              if (-not (Test-Path $SourcePath)) {
+                throw "$AppType application source not found: $SourcePath"
+              }
+              
+              Write-Host "  Adding $AppType application..." -ForegroundColor Blue
+              
+              # Add version file
+              Set-Content -Path "$SourcePath\version.txt" -Value $Version
+              
+              # Remove web.config (managed by deployment environment)
+              $webConfigPath = "$SourcePath\web.config"
+              if (Test-Path $webConfigPath) {
+                Remove-Item $webConfigPath -Force
+                Write-Host "    Removed web.config for environment-specific configuration"
+              }
+              
+              # Copy to temp directory
+              $targetName = Split-Path $SourcePath -Leaf
+              Copy-Item -Path $SourcePath -Destination "$($paths.tempDir)\$targetName" -Recurse -Force
+              
+              Write-Host "    $AppType application packaged" -ForegroundColor Green
+            }
+            
+            # Package web application
+            Add-ApplicationToPackage -SourcePath $paths.webSource -AppType "Web" -Version $config.version
+            
+            # Package API application (if applicable)
+            if (-not $config.webOnly) {
+              Add-ApplicationToPackage -SourcePath $paths.apiSource -AppType "API" -Version $config.version
+            }
+            
+            # Create deployment archive
+            Write-Host "  Creating deployment archive..." -ForegroundColor Blue
+            Compress-Archive -Path "$($paths.tempDir)\*" -DestinationPath $paths.zipFile -Force
+            
+            # Verify package
+            $packageSize = (Get-Item $paths.zipFile).Length
+            $packageSizeMB = [math]::Round($packageSize / 1MB, 2)
+            
+            Write-Host "Deployment package created successfully" -ForegroundColor Green
+            Write-Host "  File: $($paths.zipFile)"
+            Write-Host "  Size: $packageSizeMB MB"
+            
+            # Set output for next step
+            "package-path=$($paths.zipFile)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+          catch {
+            Write-Error "Package creation failed: $($_.Exception.Message)"
+            Write-Host "Temp directory contents:"
+            if (Test-Path $paths.tempDir) {
+              Get-ChildItem $paths.tempDir -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
+            }
+            exit 1
+          }
+
+      - name: Publish deployment artifacts
+        id: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "${{ steps.parameters.outputs.app_name }} Package v${{ steps.version.outputs.version }}"
+          tag_name: "${{ steps.version.outputs.release-tag }}"
+          files: ${{ github.workspace }}\${{ steps.package.outputs.package-path }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Cleanup temporary files
+        if: always()
+        shell: pwsh
+        run: |
+          try {
+            $tempDir = "${{ env.PACKAGE_TEMP_DIR }}"
+            if (Test-Path $tempDir) {
+              Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "Temporary packaging files cleaned up" -ForegroundColor Blue
+            }
+          }
+          catch {
+            Write-Warning "Failed to cleanup temporary files: $($_.Exception.Message)"
+          }
+
+      - name: Print build summary
+
+
+
+
+
+
+
+      - name: Transform configuration
+        if: needs.validate-inputs.outputs.publishArtifacts == 'true'
+        shell: pwsh
+        run: |
+          $transformScript = "./scripts/utils/transform-config.ps1"
+          if (Test-Path $transformScript) {
+            & $transformScript -Environment "${{ needs.validate-inputs.outputs.environment }}" -PublishPath "./publish"
+          } else {
+            Write-Host "⚠️ Transform script not found. Skipping."
+          }
+
+      - name: Create deployment package
+        if: needs.validate-inputs.outputs.publishArtifacts == 'true'
+        shell: pwsh
+        run: |
+          $zipScript = "./scripts/utils/zip-artifact.ps1"
+          if (Test-Path $zipScript) {
+            & $zipScript -SourcePath "./publish" -OutputPath "./artifacts/${{ needs.validate-inputs.outputs.artifactName }}.zip"
+          } else {
+            New-Item -ItemType Directory -Path "./artifacts" -Force | Out-Null
+            Compress-Archive -Path "./publish/*" -DestinationPath "./artifacts/${{ needs.validate-inputs.outputs.artifactName }}.zip"
+          }
+
+      - name: Upload build artifacts
+        if: needs.validate-inputs.outputs.publishArtifacts == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ needs.validate-inputs.outputs.artifactName }}-${{ github.run_number }}
+          path: ./artifacts
+
+  security-scan:
+    name: 'Security Scan'
+    runs-on: ubuntu-latest
+    needs: validate-inputs
+    if: needs.validate-inputs.outputs.runSecurityScan == 'true' && needs.validate-inputs.outputs.solutionExists == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Run security scan
+        uses: ./.github/actions/security-scan
+        with:
+          solution-path: ${{ needs.validate-inputs.outputs.solutionPath }}
+          sonar-token: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Upload security scan results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-scan-results-${{ github.run_number }}
+          path: ./security-results
+
+  notify:
+    name: 'Notify'
+    runs-on: ubuntu-latest
+    needs: [build, security-scan]
+    if: always() && secrets.SLACK_WEBHOOK != ''
+    steps:
+      - name: Notify success
+        if: needs.build.result == 'success' && (needs.security-scan.result == 'success' || needs.security-scan.result == 'skipped')
+        uses: ./.github/actions/notify-slack
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          status: 'success'
+          message: |
+            ✅ CI Build Successful
+            • Solution: ${{ needs.validate-inputs.outputs.solutionPath }}
+            • Environment: ${{ needs.validate-inputs.outputs.environment }}
+            • Artifact: ${{ needs.validate-inputs.outputs.artifactName }}-${{ github.run_number }}
+            • Run: ${{ github.run_number }}
+
+      - name: Notify failure
+        if: needs.build.result == 'failure' || needs.security-scan.result == 'failure'
+        uses: ./.github/actions/notify-slack
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          status: 'failure'
+          message: |
+            ❌ CI Build Failed
+            • Solution: ${{ needs.validate-inputs.outputs.solutionPath }}
+            • Environment: ${{ needs.validate-inputs.outputs.environment }}
+            • Run: ${{ github.run_number }}
+            • Check logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

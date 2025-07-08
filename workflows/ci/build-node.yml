@@ -1,0 +1,577 @@
+name: .NET Build Template
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: 'Application name for packaging'
+        required: true
+        type: string
+      web_name:
+        description: 'Web project name'
+        required: true
+        type: string
+      api_name:
+        description: 'API project name (optional for web-only builds)'
+        required: false
+        type: string
+        default: ''
+      solution_name:
+        description: 'Solution file name'
+        required: true
+        type: string
+      web_only:
+        description: 'Build web application only (skip API)'
+        required: false
+        type: boolean
+        default: false
+    
+    outputs:
+      version:
+        description: 'Generated build version'
+        value: ${{ jobs.build.outputs.version }}
+      release_tag:
+        description: 'Generated release tag'
+        value: ${{ jobs.build.outputs.release_tag }}
+      package_path:
+        description: 'Path to deployment package'
+        value: ${{ jobs.build.outputs.package_path }}
+      package_url:
+        description: 'URL to download deployment package'
+        value: ${{ jobs.build.outputs.package_url }}
+    
+    secrets:
+      GH_TOKEN:
+        description: 'GitHub token for publishing release artifacts'
+        required: true
+      EMAIL_USERNAME:
+        description: 'SMTP username for email notifications'
+        required: true
+      EMAIL_PASSWORD:
+        description: 'SMTP password for email notifications'
+        required: true
+      EMAIL_RECIPIENTS:
+        description: 'Comma-separated list of email recipients'
+        required: true     
+
+env:
+  DEPLOY_DIR: deploy
+  PACKAGE_TEMP_DIR: deploy/_package_temp
+
+
+jobs:
+  validate-inputs:
+    name: Validate Build Parameters
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate required inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          $inputs = @{
+            app_name = '${{ inputs.app_name }}'.Trim()
+            web_name = '${{ inputs.web_name }}'.Trim()
+            api_name = '${{ inputs.api_name }}'.Trim()
+            solution_name = '${{ inputs.solution_name }}'.Trim()
+            web_only = [bool]('${{ inputs.web_only }}' -eq 'true')
+          }
+          
+          # Validate required fields
+          $errors = @()
+          if ([string]::IsNullOrWhiteSpace($inputs.app_name)) {
+            $errors += "app_name is required"
+          }
+          if ([string]::IsNullOrWhiteSpace($inputs.web_name)) {
+            $errors += "web_name is required"
+          }
+          if ([string]::IsNullOrWhiteSpace($inputs.solution_name)) {
+            $errors += "solution_name is required"
+          }
+          if (-not $inputs.web_only -and [string]::IsNullOrWhiteSpace($inputs.api_name)) {
+            $errors += "api_name is required when web_only is false"
+          }
+          
+          if ($errors.Count -gt 0) {
+            Write-Error "Input validation failed:`n$($errors -join "`n")"
+            exit 1
+          }
+          
+          Write-Host "All required inputs validated successfully" -ForegroundColor Green
+
+      - name: Check solution exists
+        shell: pwsh
+        run: |
+          if (Test-Path "${{ inputs.solution_name }}") {           
+            Write-Host "Found solution file"
+          } else {
+            Write-Host "Solution file not found"         
+            exit 1
+          }
+
+  build:
+    name: Build Solution
+    runs-on: windows-latest
+    needs: validate-inputs
+    
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.version.outputs.release-tag }}
+      package_path: ${{ steps.package.outputs.package-path }}
+      package_url: ${{ steps.publish.outputs.upload_url }}
+
+    steps:
+      - name: Print build context
+        shell: pwsh
+        run: |
+          Write-Host "Build Context" -ForegroundColor Cyan
+          Write-Host "  Repository: ${{ github.repository }}"
+          Write-Host "  Branch: ${{ github.ref_name }}"
+          Write-Host "  Triggered by: ${{ github.actor }}"
+          Write-Host "  Event: ${{ github.event_name }}"        
+          Write-Host "  Application: ${{ inputs.app_name }}"
+          Write-Host "  Solution: ${{ inputs.solution_name }}"
+          Write-Host "  Web Project: ${{ inputs.web_name }}"
+          Write-Host "  API Project: ${{ inputs.api_name }}"
+          Write-Host "  Web Only: ${{ inputs.web_only }}"
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup build environment
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          Write-Host "Restoring NuGet packages..." -ForegroundColor Yellow
+          
+          try {
+            nuget restore "${{ inputs.solution_name }}"
+            Write-Host "NuGet package restore completed" -ForegroundColor Green
+          }
+          catch {
+            Write-Error "Package restoration failed: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Generate build version
+        id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          Write-Host "Generating build version..." -ForegroundColor Yellow
+          
+          $buildDate = Get-Date
+          $version = @{
+            major = $buildDate.ToString("yy")
+            minor = $buildDate.ToString("MM")  
+            patch = $buildDate.ToString("dd")
+            build = "{0:D4}" -f ([int]${{ github.run_number }} + 1000)
+          }
+          
+          $semanticVersion = "$($version.major).$($version.minor).$($version.patch).$($version.build)"
+          $releaseTag = "v$semanticVersion"
+          
+          # Set outputs
+          "version=$semanticVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "release-tag=$releaseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          
+          Write-Host "Version generated successfully" -ForegroundColor Green
+          Write-Host "  Version: $semanticVersion"
+          Write-Host "  Tag: $releaseTag"      
+
+      - name: Apply version to assemblies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          Write-Host "Applying version to assembly files..." -ForegroundColor Yellow
+          
+          try {
+            $version = "${{ steps.version.outputs.version }}"
+            $files = Get-ChildItem -Path . -Recurse -Filter "AssemblyInfo.cs"
+            
+            foreach ($file in $files) {
+              $content = Get-Content $file.FullName
+              $content = $content -replace 'AssemblyVersion\(".*?"\)', "AssemblyVersion(`"$version`")"
+              $content = $content -replace 'AssemblyFileVersion\(".*?"\)', "AssemblyFileVersion(`"$version`")"
+              $content | Set-Content $file.FullName
+              Write-Host "  Updated: $($file.FullName)"
+            }
+            
+            Write-Host "Assembly version update completed" -ForegroundColor Green
+          }
+          catch {
+            Write-Error "Failed to update assembly versions: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Build solution
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          Write-Host "Building solution..." -ForegroundColor Yellow
+          
+          try {
+            $buildArgs = @(
+              "${{ inputs.solution_name }}"
+              "/p:Configuration=${{ env.BUILD_CONFIGURATION }}"
+              "/p:OutputPath=build\${{ inputs.app_name }}"
+              "/p:Version=${{ steps.version.outputs.version }}"
+              "/p:AssemblyVersion=${{ steps.version.outputs.version }}"
+              "/p:FileVersion=${{ steps.version.outputs.version }}"
+              "/p:InformationalVersion=${{ steps.version.outputs.version }}"
+              "/m"
+              "/nologo"
+              "/verbosity:minimal"
+            )
+            
+            Write-Host "  Command: msbuild $($buildArgs -join ' ')"
+            & msbuild @buildArgs
+            
+            if ($LASTEXITCODE -ne 0) {
+              throw "MSBuild failed with exit code $LASTEXITCODE"
+            }
+            
+            Write-Host "Solution built successfully" -ForegroundColor Green
+          }
+          catch {
+            Write-Error "Build failed: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Package deployment artifacts
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          Write-Host "Creating deployment package..." -ForegroundColor Yellow
+          
+          try {
+            $paths = @{
+              deployDir = "${{ env.DEPLOY_DIR }}"
+              tempDir = "${{ env.PACKAGE_TEMP_DIR }}"
+              zipFile = "${{ env.DEPLOY_DIR }}\${{ inputs.app_name }}.${{ steps.version.outputs.version }}.zip"
+              webSource = "${{ inputs.web_name }}\build\${{ inputs.app_name }}\_PublishedWebsites\${{ inputs.web_name }}"
+              apiSource = "${{ inputs.api_name }}\build\${{ inputs.app_name }}\_PublishedWebsites\${{ inputs.api_name }}"
+            }
+            
+            # Prepare directories
+            New-Item -ItemType Directory -Force -Path $paths.deployDir | Out-Null
+            if (Test-Path $paths.tempDir) { 
+              Remove-Item $paths.tempDir -Recurse -Force 
+            }
+            New-Item -ItemType Directory -Force -Path $paths.tempDir | Out-Null
+            
+            function Add-ApplicationToPackage {
+              param([string]$SourcePath, [string]$AppType, [string]$Version)
+              
+              if (-not (Test-Path $SourcePath)) {
+                throw "$AppType application source not found: $SourcePath"
+              }
+              
+              Write-Host "  Adding $AppType application..." -ForegroundColor Blue
+              
+              # Add version file
+              Set-Content -Path "$SourcePath\version.txt" -Value $Version
+              
+              # Remove web.config (managed by deployment environment)
+              $webConfigPath = "$SourcePath\web.config"
+              if (Test-Path $webConfigPath) {
+                Remove-Item $webConfigPath -Force
+                Write-Host "    Removed web.config for environment-specific configuration"
+              }
+              
+              # Copy to temp directory
+              $targetName = Split-Path $SourcePath -Leaf
+              Copy-Item -Path $SourcePath -Destination "$($paths.tempDir)\$targetName" -Recurse -Force
+              
+              Write-Host "    $AppType application packaged" -ForegroundColor Green
+            }
+            
+            # Package web application
+            Add-ApplicationToPackage -SourcePath $paths.webSource -AppType "Web" -Version "${{ steps.version.outputs.version }}"
+            
+            # Package API application (if applicable)
+            if (-not [bool]('${{ inputs.web_only }}' -eq 'true')) {
+              Add-ApplicationToPackage -SourcePath $paths.apiSource -AppType "API" -Version "${{ steps.version.outputs.version }}"
+            }
+            
+            # Create deployment archive
+            Write-Host "  Creating deployment archive..." -ForegroundColor Blue
+            Compress-Archive -Path "$($paths.tempDir)\*" -DestinationPath $paths.zipFile -Force
+            
+            # Verify package
+            $packageSize = (Get-Item $paths.zipFile).Length
+            $packageSizeMB = [math]::Round($packageSize / 1MB, 2)
+            
+            Write-Host "Deployment package created successfully" -ForegroundColor Green
+            Write-Host "  File: $($paths.zipFile)"
+            Write-Host "  Size: $packageSizeMB MB"
+            
+            # Set output for next step
+            "package-path=$($paths.zipFile)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+          catch {
+            Write-Error "Package creation failed: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Publish deployment artifacts
+        id: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "${{ inputs.app_name }} Package v${{ steps.version.outputs.version }}"
+          tag_name: "${{ steps.version.outputs.release-tag }}"
+          files: ${{ github.workspace }}\${{ steps.package.outputs.package-path }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Cleanup temporary files
+        if: always()
+        shell: pwsh
+        run: |
+          try {
+            $tempDir = "${{ env.PACKAGE_TEMP_DIR }}"
+            if (Test-Path $tempDir) {
+              Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "Temporary packaging files cleaned up" -ForegroundColor Blue
+            }
+          }
+          catch {
+            Write-Warning "Failed to cleanup temporary files: $($_.Exception.Message)"
+          }
+
+      - name: Generate build summary
+        shell: pwsh
+        run: |
+          $releaseUrl = "https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.release-tag }}"
+          
+          Write-Host ""
+          Write-Host "Build Summary" -ForegroundColor Green
+          Write-Host "=" * 60
+          Write-Host "  Application: ${{ inputs.app_name }}"
+          Write-Host "  Version: ${{ steps.version.outputs.version }}"
+          Write-Host "  Release Tag: ${{ steps.version.outputs.release-tag }}"
+          Write-Host "  Branch: ${{ github.ref_name }}"
+          Write-Host "  Release URL: $releaseUrl"
+          Write-Host "  Built by: ${{ github.actor }}"
+          Write-Host "  Run Number: ${{ github.run_number }}"
+          Write-Host "  Configuration: ${{ env.BUILD_CONFIGURATION }}"
+          Write-Host "  Web Only: ${{ inputs.web_only }}"
+          Write-Host "=" * 60
+          
+          # GitHub Actions notices
+          Write-Host "##[notice title=Release Created]$releaseUrl"
+          Write-Host "##[notice title=Package Version]${{ steps.version.outputs.version }}"
+          Write-Host "##[notice title=Branch]${{ github.ref_name }}"
+
+  notify:
+    name: Send Build Notifications
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    
+    steps:
+      - name: Checkout for notification actions
+        uses: actions/checkout@v4
+      
+      - name: Prepare notification data
+        id: notification-data
+        shell: pwsh
+        run: |
+          $buildStatus = '${{ needs.build.result }}'
+          $version = '${{ needs.build.outputs.version }}'
+          $releaseTag = '${{ needs.build.outputs.release_tag }}'
+          $packageUrl = '${{ needs.build.outputs.package_url }}'
+          $appName = '${{ inputs.app_name }}'
+          $branch = '${{ github.ref_name }}'
+          $actor = '${{ github.actor }}'
+          $runNumber = '${{ github.run_number }}'
+          $repoUrl = "https://github.com/${{ github.repository }}"
+          $releaseUrl = "$repoUrl/releases/tag/$releaseTag"
+          $workflowUrl = "$repoUrl/actions/runs/${{ github.run_id }}"
+          
+          # Determine status text and color
+          if ($buildStatus -eq 'success') {
+            $statusText = 'SUCCESS'
+            $statusColor = 'good'
+          } else {
+            $statusText = 'FAILED'
+            $statusColor = 'danger'
+          }
+          
+          # Set outputs for notification actions
+          "build-status=$buildStatus" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "status-color=$statusColor" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "status-text=$statusText" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "app-name=$appName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "release-tag=$releaseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "release-url=$releaseUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "workflow-url=$workflowUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "branch=$branch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "actor=$actor" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "run-number=$runNumber" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          
+          Write-Host "Notification data prepared for: $statusText" -ForegroundColor $(if ($buildStatus -eq 'success') { 'Green' } else { 'Red' })
+
+      - name: Send email notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "Build ${{ steps.notification-data.outputs.status-text }}: ${{ inputs.app_name }} v${{ steps.notification-data.outputs.version }}"
+          to: ${{ secrets.EMAIL_RECIPIENTS }}
+          from: "CI/CD Pipeline <${{ secrets.EMAIL_USERNAME }}>"
+          html_body: |
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5; }
+                    .container { max-width: 600px; margin: 0 auto; background-color: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                    .header { background-color: ${{ steps.notification-data.outputs.build-status == 'success' && '#28a745' || '#dc3545' }}; color: white; padding: 20px; text-align: center; }
+                    .header h1 { margin: 0; font-size: 24px; }
+                    .content { padding: 20px; }
+                    .status-badge { display: inline-block; padding: 8px 16px; border-radius: 20px; font-weight: bold; margin: 10px 0; }
+                    .success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+                    .failure { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+                    .info-table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+                    .info-table th, .info-table td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+                    .info-table th { background-color: #f8f9fa; font-weight: bold; }
+                    .button { display: inline-block; padding: 12px 24px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px; margin: 10px 5px; }
+                    .button:hover { background-color: #0056b3; }
+                    .footer { background-color: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #666; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <h1>Build ${{ steps.notification-data.outputs.status-text }}</h1>
+                    </div>
+                    <div class="content">
+                        <div class="status-badge ${{ steps.notification-data.outputs.build-status == 'success' && 'success' || 'failure' }}">
+                            ${{ steps.notification-data.outputs.status-text }}
+                        </div>
+                        
+                        <table class="info-table">
+                            <tr>
+                                <th>Application</th>
+                                <td>${{ inputs.app_name }}</td>
+                            </tr>
+                            <tr>
+                                <th>Version</th>
+                                <td>${{ steps.notification-data.outputs.version }}</td>
+                            </tr>
+                            <tr>
+                                <th>Release Tag</th>
+                                <td>${{ steps.notification-data.outputs.release-tag }}</td>
+                            </tr>
+                            <tr>
+                                <th>Branch</th>
+                                <td>${{ steps.notification-data.outputs.branch }}</td>
+                            </tr>
+                            <tr>
+                                <th>Triggered By</th>
+                                <td>${{ steps.notification-data.outputs.actor }}</td>
+                            </tr>
+                            <tr>
+                                <th>Run Number</th>
+                                <td>${{ steps.notification-data.outputs.run-number }}</td>
+                            </tr>
+                            <tr>
+                                <th>Repository</th>
+                                <td>${{ github.repository }}</td>
+                            </tr>
+                        </table>
+                        
+                        <div style="text-align: center; margin: 20px 0;">
+                            <a href="${{ steps.notification-data.outputs.workflow-url }}" class="button">View Workflow Run</a>
+                            ${{ steps.notification-data.outputs.build-status == 'success' && format('<a href="{0}" class="button">Download Release</a>', steps.notification-data.outputs.release-url) || '' }}
+                        </div>
+                        
+                        ${{ steps.notification-data.outputs.build-status == 'success' && 
+                            '<p style="color: #28a745; font-weight: bold;">Build completed successfully! The application is ready for deployment.</p>' || 
+                            '<p style="color: #dc3545; font-weight: bold;">Build failed. Please check the workflow logs for details.</p>' }}
+                    </div>
+                    <div class="footer">
+                        <p>This notification was sent automatically by the CI/CD pipeline.</p>
+                        <p>Timestamp: ${{ github.event.head_commit.timestamp }}</p>
+                    </div>
+                </div>
+            </body>
+            </html>
+          
+          # Plain text fallback
+          body: |
+            Build ${{ steps.notification-data.outputs.status-text }}: ${{ inputs.app_name }}
+            
+            Application: ${{ inputs.app_name }}
+            Version: ${{ steps.notification-data.outputs.version }}
+            Release Tag: ${{ steps.notification-data.outputs.release-tag }}
+            Branch: ${{ steps.notification-data.outputs.branch }}
+            Triggered By: ${{ steps.notification-data.outputs.actor }}
+            Run Number: ${{ steps.notification-data.outputs.run-number }}
+            Repository: ${{ github.repository }}
+            
+            Workflow URL: ${{ steps.notification-data.outputs.workflow-url }}
+            ${{ steps.notification-data.outputs.build-status == 'success' && format('Release URL: {0}', steps.notification-data.outputs.release-url) || '' }}
+            
+            Status: ${{ steps.notification-data.outputs.build-status == 'success' && 'Build completed successfully!' || 'Build failed - check logs for details.' }}
+
+      - name: Send Teams notification
+        uses: microsoft/teams-notifications-action@v1
+        if: success() || failure()
+        with:
+          webhookUrl: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          title: "Build ${{ steps.notification-data.outputs.status-text }}: ${{ inputs.app_name }} v${{ steps.notification-data.outputs.version }}"
+          summary: "Build for ${{ inputs.app_name }} completed with status: ${{ steps.notification-data.outputs.status-text }}"
+          themeColor: ${{ steps.notification-data.outputs.status-color }}
+          sections: |
+            - activityTitle: "Build Details"
+              facts:
+                - name: "Application"
+                  value: "${{ inputs.app_name }}"
+                - name: "Version"
+                  value: "${{ steps.notification-data.outputs.version }}"
+                - name: "Branch"
+                  value: "${{ steps.notification-data.outputs.branch }}"
+                - name: "Triggered By"
+                  value: "${{ steps.notification-data.outputs.actor }}"
+                - name: "Run Number"
+                  value: "${{ steps.notification-data.outputs.run-number }}"
+              markdown: true
+          potentialAction: |
+            - name: "View Workflow Run"
+              url: "${{ steps.notification-data.outputs.workflow-url }}"
+            ${{ steps.notification-data.outputs.build-status == 'success' && format('- name: "Download Release"\n  url: "{0}"', steps.notification-data.outputs.release-url) || '' }}
+
+      - name: Log notification status
+        shell: pwsh
+        run: |
+          $buildStatus = '${{ needs.build.result }}'
+          $appName = '${{ inputs.app_name }}'
+          $version = '${{ steps.notification-data.outputs.version }}'
+          
+          if ($buildStatus -eq 'success') {
+            Write-Host "Success notification sent for $appName v$version" -ForegroundColor Green
+          } else {
+            Write-Host "Failure notification sent for $appName v$version" -ForegroundColor Red
+          }
+          
+          Write-Host "Email and Teams notifications completed" -ForegroundColor Blue

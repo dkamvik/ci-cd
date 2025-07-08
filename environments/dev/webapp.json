@@ -1,0 +1,106 @@
+{
+  "environment": "dev",
+  "connectionStrings": {
+    "DefaultConnection": "Server=dev-sql-server;Database=SimpleWebApp_Dev;Trusted_Connection=true;MultipleActiveResultSets=true",
+    "CacheConnection": "dev-redis-server:6379",
+    "LoggingConnection": "Server=dev-sql-server;Database=Logging_Dev;Trusted_Connection=true"
+  },
+  "apiEndpoints": {
+    "BaseApiUrl": "https://api-dev.company.com",
+    "AuthApiUrl": "https://auth-dev.company.com",
+    "NotificationApiUrl": "https://notifications-dev.company.com"
+  },
+  "logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning",
+      "Microsoft.EntityFrameworkCore": "Information",
+      "System": "Warning"
+    },
+    "Console": {
+      "LogLevel": {
+        "Default": "Information"
+      }
+    },
+    "File": {
+      "LogLevel": {
+        "Default": "Information"
+      },
+      "Path": "logs/app-{Date}.log",
+      "RollingInterval": "Day",
+      "RetainedFileCountLimit": 7
+    }
+  },
+  "appSettings": {
+    "ApplicationName": "Simple Web App - Development",
+    "AllowedHosts": "*",
+    "DetailedErrors": true,
+    "EnableSwagger": true,
+    "CacheExpirationMinutes": 5,
+    "MaxUploadSizeBytes": 10485760,
+    "EnableHealthChecks": true,
+    "HealthCheckPath": "/health"
+  },
+  "security": {
+    "AllowedOrigins": [
+      "https://localhost:3000",
+      "https://dev.company.com"
+    ],
+    "RequireHttps": false,
+    "EnableCors": true,
+    "JwtSettings": {
+      "Issuer": "https://auth-dev.company.com",
+      "Audience": "simple-webapp-dev",
+      "ExpirationMinutes": 60
+    }
+  },
+  "features": {
+    "EnableNewFeature": true,
+    "EnableBetaFeatures": true,
+    "EnableAnalytics": false,
+    "EnableCaching": true,
+    "EnableBackgroundJobs": true
+  },
+  "externalServices": {
+    "EmailService": {
+      "Provider": "SendGrid",
+      "ApiUrl": "https://api.sendgrid.com",
+      "FromEmail": "noreply-dev@company.com",
+      "FromName": "Simple Web App Dev"
+    },
+    "StorageService": {
+      "Provider": "Azure",
+      "ConnectionString": "DefaultEndpointsProtocol=https;AccountName=devstorageaccount;AccountKey=...",
+      "ContainerName": "webapp-dev"
+    }
+  },
+  "monitoring": {
+    "ApplicationInsights": {
+      "InstrumentationKey": "dev-instrumentation-key-here",
+      "EnableSqlCommandTextInstrumentation": true
+    },
+    "Serilog": {
+      "MinimumLevel": "Information",
+      "EnableStructuredLogging": true
+    }
+  },
+  "deployment": {
+    "IIS": {
+      "SiteName": "SimpleWebApp-Dev",
+      "ApplicationPool": "SimpleWebApp-Dev-Pool",
+      "PhysicalPath": "C:\\inetpub\\wwwroot\\SimpleWebApp-Dev",
+      "Bindings": [
+        {
+          "Protocol": "http",
+          "Port": 8080,
+          "HostName": "webapp-dev.company.local"
+        }
+      ]
+    },
+    "Database": {
+      "RunMigrations": true,
+      "SeedData": true,
+      "BackupBeforeDeployment": false
+    }
+  }
+}

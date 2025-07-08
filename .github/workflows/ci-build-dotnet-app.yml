@@ -1,0 +1,408 @@
+name: CI Build Workflow
+
+on:
+  workflow_call:
+    inputs:
+      params:
+        description: 'Build configuration parameters in JSON format'
+        required: true
+        type: string
+    secrets:
+      GH_TOKEN:
+        description: 'GitHub token for publishing release artifacts'
+        required: true
+
+env:
+  BUILD_CONFIGURATION: Release
+  DEPLOY_DIR: deploy
+  PACKAGE_TEMP_DIR: deploy\_package_temp
+  NUGET_PACKAGES_DIRECTORY: .nuget\packages
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    outputs:
+      version: ${{ steps.version.outputs.version }}  
+
+    steps:
+      - name: Parse input parameters
+        id: parameters
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          try {
+            $params = '${{ inputs.params }}' | ConvertFrom-Json
+            
+            # Required parameters validation
+            $requiredParams = @('app_name', 'web_name', 'solution_name')
+            $missingParams = $requiredParams | Where-Object { -not $params.$_ }
+            
+            if ($missingParams) {
+              throw "Missing required parameters: $($missingParams -join ', ')"
+            }
+
+            # Parse and validate configuration
+            $config = @{
+              app_name = $params.app_name.Trim()
+              web_name = $params.web_name.Trim()
+              api_name = ($params.api_name ?? "").Trim()
+              solution_name = $params.solution_name.Trim()
+              web_only = [bool]($params.web_only -eq "true" -or $params.web_only -eq $true)
+            }
+            
+            # Set outputs
+            $config.GetEnumerator() | ForEach-Object {
+              "$($_.Key)=$($_.Value)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            }
+            
+            Write-Host "Build parameters parsed successfully" -ForegroundColor Green
+            Write-Host "  App: $($config.app_name)"
+            Write-Host "  Web: $($config.web_name)"
+            Write-Host "  API: $($config.api_name)"
+            Write-Host "  Solution: $($config.solution_name)"
+            Write-Host "  Web Only: $($config.web_only)"
+          }
+          catch {
+            Write-Error "Parameter parsing failed: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Print build context
+        shell: pwsh
+        run: |
+          Write-Host "Build Context" -ForegroundColor Cyan
+          Write-Host "  Repository: ${{ github.repository }}"
+          Write-Host "  Branch: ${{ github.ref_name }}"
+          Write-Host "  Triggered by: ${{ github.actor }}"
+          Write-Host "  Event: ${{ github.event_name }}"
+          Write-Host "  Run Number: ${{ github.run_number }}"
+          Write-Host "  Application: ${{ steps.parameters.outputs.app_name }}"
+          Write-Host "  Solution: ${{ steps.parameters.outputs.solution_name }}"
+          Write-Host "  Configuration: ${{ env.BUILD_CONFIGURATION }}"
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  
+
+      - name: Setup build environment
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Restore project dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          try {
+            Write-Host "Starting NuGet package restore..."
+            nuget restore "${{ steps.parameters.outputs.solution_name }}"
+            Write-Host "NuGet package restore completed."
+          }
+          catch {
+            Write-Error "Package restoration failed: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Generate build version
+        id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          try {
+            Write-Host "Generating build version" -ForegroundColor Yellow
+            
+            $buildDate = Get-Date
+            $version = @{
+              major = $buildDate.ToString("yy")
+              minor = $buildDate.ToString("MM")  
+              patch = $buildDate.ToString("dd")
+              build = "{0:D4}" -f ([int]${{ github.run_number }} + 1000)
+            }
+            
+            $semanticVersion = "$($version.major).$($version.minor).$($version.patch).$($version.build)"
+            $releaseTag = "v$semanticVersion"
+            
+            # Set outputs
+            "version=$semanticVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "release-tag=$releaseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            
+            Write-Host "Version generated successfully" -ForegroundColor Green
+            Write-Host "  Version: $semanticVersion"
+            Write-Host "  Tag: $releaseTag"           
+          }
+          catch {
+            Write-Error "Version generation failed: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Apply build versions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          try {
+            Write-Host "Starting to apply version to assembly files..."
+            $version = "${{ steps.version.outputs.version }}"
+            $files = Get-ChildItem -Path . -Recurse -Filter AssemblyInfo.cs
+            foreach ($file in $files) {
+              $content = Get-Content $file.FullName
+              $content = $content -replace 'AssemblyVersion\(".*?"\)', "AssemblyVersion(`"$version`")"
+              $content = $content -replace 'AssemblyFileVersion\(".*?"\)', "AssemblyFileVersion(`"$version`")"
+              $content | Set-Content $file.FullName
+            }
+            Write-Host "Assembly version update completed."
+          }
+          catch {
+            Write-Error "Failed to update assembly versions: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: Build solution
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          try {
+            $config = @{
+              solution = "${{ steps.parameters.outputs.solution_name }}"
+              configuration = "${{ env.BUILD_CONFIGURATION }}"
+              appName = "${{ steps.parameters.outputs.app_name }}"
+              version = "${{ steps.version.outputs.version }}"
+            }
+            
+            Write-Host "Building solution" -ForegroundColor Yellow
+            Write-Host "  Solution: $($config.solution)"
+            Write-Host "  Configuration: $($config.configuration)"
+            Write-Host "  Output Path: build\$($config.appName)"
+            
+            # Build with MSBuild
+            $buildArgs = @(
+              $config.solution
+              "/p:Configuration=$($config.configuration)"
+              "/p:OutputPath=build\$($config.appName)"
+              "/p:Version=$($config.version)"
+              "/p:AssemblyVersion=$($config.version)"
+              "/p:FileVersion=$($config.version)"
+              "/p:InformationalVersion=$($config.version)"
+              "/m"  # Multi-processor build
+              "/nologo"
+              "/verbosity:minimal"
+            )
+            
+            Write-Host "  Command: msbuild $($buildArgs -join ' ')"
+            
+            & msbuild @buildArgs
+            
+            if ($LASTEXITCODE -ne 0) {
+              throw "MSBuild failed with exit code $LASTEXITCODE"
+            }
+            
+            Write-Host "Solution built successfully" -ForegroundColor Green
+          }
+          catch {
+            Write-Error "Build failed: $($_.Exception.Message)"
+            Write-Host "Build arguments used:"
+            $buildArgs | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          try {
+            $config = @{
+              appName = "${{ steps.parameters.outputs.app_name }}"
+              webName = "${{ steps.parameters.outputs.web_name }}"
+              apiName = "${{ steps.parameters.outputs.api_name }}"
+              webOnly = "${{ steps.parameters.outputs.web_only }}" -ieq "true"
+            }
+            
+            Write-Host "Verifying build outputs" -ForegroundColor Yellow
+            
+            # Check web output
+            $webOutputPath = "$($config.webName)\build\$($config.appName)\_PublishedWebsites\$($config.webName)"
+            if (-not (Test-Path $webOutputPath)) {
+              throw "Web application build output not found: $webOutputPath"
+            }
+            Write-Host "  Web output verified: $webOutputPath" -ForegroundColor Green
+            
+            # Check API output (if not web-only)
+            if (-not $config.webOnly) {
+              $apiOutputPath = "$($config.apiName)\build\$($config.appName)\_PublishedWebsites\$($config.apiName)"
+              if (-not (Test-Path $apiOutputPath)) {
+                throw "API application build output not found: $apiOutputPath"
+              }
+              Write-Host "  API output verified: $apiOutputPath" -ForegroundColor Green
+            }
+            
+            Write-Host "All build outputs verified successfully" -ForegroundColor Green
+          }
+          catch {
+            Write-Error "Build output verification failed: $($_.Exception.Message)"
+            Write-Host "Available build directories:"
+            Get-ChildItem -Path . -Recurse -Directory -Filter "*build*" | ForEach-Object {
+              Write-Host "  $($_.FullName)"
+            }
+            exit 1
+          }
+
+      - name: Package deployment artifacts
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          try {
+            $config = @{
+              appName = "${{ steps.parameters.outputs.app_name }}"
+              webName = "${{ steps.parameters.outputs.web_name }}"
+              apiName = "${{ steps.parameters.outputs.api_name }}"
+              version = "${{ steps.version.outputs.version }}"
+              webOnly = "${{ steps.parameters.outputs.web_only }}" -ieq "true"
+            }
+            
+            $paths = @{
+              deployDir = "${{ env.DEPLOY_DIR }}"
+              tempDir = "${{ env.PACKAGE_TEMP_DIR }}"
+              zipFile = "${{ env.DEPLOY_DIR }}\$($config.appName).$($config.version).zip"
+              webSource = "$($config.webName)\build\$($config.appName)\_PublishedWebsites\$($config.webName)"
+              apiSource = "$($config.apiName)\build\$($config.appName)\_PublishedWebsites\$($config.apiName)"
+            }
+            
+            Write-Host "Creating deployment package" -ForegroundColor Yellow
+            Write-Host "  Package: $($config.appName).$($config.version).zip"
+            
+            # Prepare directories
+            New-Item -ItemType Directory -Force -Path $paths.deployDir | Out-Null
+            if (Test-Path $paths.tempDir) { 
+              Remove-Item $paths.tempDir -Recurse -Force 
+            }
+            New-Item -ItemType Directory -Force -Path $paths.tempDir | Out-Null
+            
+            function Add-ApplicationToPackage {
+              param([string]$SourcePath, [string]$AppType, [string]$Version)
+              
+              if (-not (Test-Path $SourcePath)) {
+                throw "$AppType application source not found: $SourcePath"
+              }
+              
+              Write-Host "  Adding $AppType application..." -ForegroundColor Blue
+              
+              # Add version file
+              Set-Content -Path "$SourcePath\version.txt" -Value $Version
+              
+              # Remove web.config (managed by deployment environment)
+              $webConfigPath = "$SourcePath\web.config"
+              if (Test-Path $webConfigPath) {
+                Remove-Item $webConfigPath -Force
+                Write-Host "    Removed web.config for environment-specific configuration"
+              }
+              
+              # Copy to temp directory
+              $targetName = Split-Path $SourcePath -Leaf
+              Copy-Item -Path $SourcePath -Destination "$($paths.tempDir)\$targetName" -Recurse -Force
+              
+              Write-Host "    $AppType application packaged" -ForegroundColor Green
+            }
+            
+            # Package web application
+            Add-ApplicationToPackage -SourcePath $paths.webSource -AppType "Web" -Version $config.version
+            
+            # Package API application (if applicable)
+            if (-not $config.webOnly) {
+              Add-ApplicationToPackage -SourcePath $paths.apiSource -AppType "API" -Version $config.version
+            }
+            
+            # Create deployment archive
+            Write-Host "  Creating deployment archive..." -ForegroundColor Blue
+            Compress-Archive -Path "$($paths.tempDir)\*" -DestinationPath $paths.zipFile -Force
+            
+            # Verify package
+            $packageSize = (Get-Item $paths.zipFile).Length
+            $packageSizeMB = [math]::Round($packageSize / 1MB, 2)
+            
+            Write-Host "Deployment package created successfully" -ForegroundColor Green
+            Write-Host "  File: $($paths.zipFile)"
+            Write-Host "  Size: $packageSizeMB MB"
+            
+            # Set output for next step
+            "package-path=$($paths.zipFile)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+          catch {
+            Write-Error "Package creation failed: $($_.Exception.Message)"
+            Write-Host "Temp directory contents:"
+            if (Test-Path $paths.tempDir) {
+              Get-ChildItem $paths.tempDir -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
+            }
+            exit 1
+          }
+
+      - name: Publish deployment artifacts
+        id: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "${{ steps.parameters.outputs.app_name }} Package v${{ steps.version.outputs.version }}"
+          tag_name: "${{ steps.version.outputs.release-tag }}"
+          files: ${{ github.workspace }}\${{ steps.package.outputs.package-path }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Cleanup temporary files
+        if: always()
+        shell: pwsh
+        run: |
+          try {
+            $tempDir = "${{ env.PACKAGE_TEMP_DIR }}"
+            if (Test-Path $tempDir) {
+              Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "Temporary packaging files cleaned up" -ForegroundColor Blue
+            }
+          }
+          catch {
+            Write-Warning "Failed to cleanup temporary files: $($_.Exception.Message)"
+          }
+
+      - name: Print build summary
+        shell: pwsh
+        run: |
+          $config = @{
+            version = "${{ steps.version.outputs.version }}"
+            tag = "${{ steps.version.outputs.release-tag }}"
+            appName = "${{ steps.parameters.outputs.app_name }}"
+            branch = "${{ github.ref_name }}"
+            repo = "${{ github.repository }}"
+            actor = "${{ github.actor }}"
+            runNumber = "${{ github.run_number }}"           
+          }
+          
+          $releaseUrl = "https://github.com/$($config.repo)/releases/tag/$($config.tag)"
+          
+          Write-Host ""
+          Write-Host "Build Summary" -ForegroundColor Green
+          Write-Host "=" * 60
+          Write-Host "  Application: $($config.appName)"
+          Write-Host "  Version: $($config.version)"
+          Write-Host "  Release Tag: $($config.tag)"
+          Write-Host "  Branch: $($config.branch)"
+          Write-Host "  Release URL: $releaseUrl"
+          Write-Host "  Built by: $($config.actor)"
+          Write-Host "  Run Number: $($config.runNumber)"
+          Write-Host "=" * 60
+          Write-Host ""
+          
+          # GitHub Actions notices
+          Write-Host "##[notice title=Release]$releaseUrl"
+          Write-Host "##[notice title=Environment]$($config.environment)"
+          Write-Host "##[notice title=Release Version]$($config.tag)"
+          Write-Host "##[notice title=Build Version]$($config.version)"
+          Write-Host "##[notice title=Branch]$($config.branch)"
+
+            

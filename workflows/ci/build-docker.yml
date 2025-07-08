@@ -1,0 +1,208 @@
+name: .NET Build Template
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: 'Application name for packaging'
+        required: true
+        type: string
+      web_name:
+        description: 'Web project name'
+        required: true
+        type: string
+      api_name:
+        description: 'API project name (optional for web-only builds)'
+        required: false
+        type: string
+        default: ''
+      solution_name:
+        description: 'Solution file name'
+        required: true
+        type: string
+      web_only:
+        description: 'Build web application only (skip API)'
+        required: false
+        type: boolean
+        default: false
+    
+    outputs:
+      version:
+        description: 'Generated build version'
+        value: ${{ jobs.build.outputs.version }}
+      release_tag:
+        description: 'Generated release tag'
+        value: ${{ jobs.build.outputs.release_tag }}
+      package_path:
+        description: 'Path to deployment package'
+        value: ${{ jobs.build.outputs.package_path }}
+      package_url:
+        description: 'URL to download deployment package'
+        value: ${{ jobs.build.outputs.package_url }}
+    
+    secrets:
+      GH_TOKEN:
+        description: 'GitHub token for publishing release artifacts'
+        required: true     
+
+env:
+  DEPLOY_DIR: deploy
+  PACKAGE_TEMP_DIR: deploy/_package_temp
+  BUILD_CONFIGURATION: Release
+
+jobs:
+  validate-inputs:
+    name: Validate Build Parameters
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Validate inputs parameters
+        shell: pwsh
+        run: |
+          ./.github/scripts/validate-inputs.ps1 `
+            -AppName "${{ inputs.app_name }}" `
+            -WebName "${{ inputs.web_name }}" `
+            -ApiName "${{ inputs.api_name }}" `
+            -SolutionName "${{ inputs.solution_name }}" `
+            -WebOnly:$${{ inputs.web_only }}
+
+      - name: Validate solution file
+        shell: pwsh
+        run: |
+          ./.github/scripts/validate-solution-file.ps1 `           
+            -SolutionName "${{ inputs.solution_name }}" 
+           
+
+  build:
+    name: Build Application
+    runs-on: windows-latest
+    needs: validate-inputs
+    
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.version.outputs.release-tag }}
+      package_path: ${{ steps.package.outputs.package-path }}
+      package_url: ${{ steps.publish.outputs.upload_url }}
+
+    steps:
+      - name: Checkout source code
+        uses: ./.github/actions/checkout-code 
+
+      - name: Setup build environment
+        uses: ./.github/actions/my-setup-msbuild 
+
+      - name: Print build context
+        shell: pwsh
+        run: |
+          ./.github/scripts/write-context.ps1 `
+            -Repository "${{ github.repository }}" `
+            -Branch "${{ github.ref_name }}" `
+            -Actor "${{ github.actor }}" `
+            -Event "${{ github.event_name }}" `
+            -AppName "${{ inputs.app_name }}" `
+            -SolutionName "${{ inputs.solution_name }}" `
+            -WebName "${{ inputs.web_name }}" `
+            -ApiName "${{ inputs.api_name }}" `
+            -WebOnly:$${{ inputs.web_only }}
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: |
+          ./.github/scripts/restore-nuget-packages.ps1 -SolutionName "${{ inputs.solution_name }}"
+
+      - name: Generate build version
+        id: version
+        shell: pwsh
+        run: |
+          ./.github/scripts/generate-version.ps1 -RunNumber ${{ github.run_number }}
+
+      - name: Apply version to assemblies
+        shell: pwsh
+        run: |
+          ./.github/scripts/Update-AssemblyVersion.ps1 -Version "${{ steps.version.outputs.version }}"
+
+      - name: Compile solution
+        shell: pwsh
+        run: |
+          ./.github/scripts/compile-solution.ps1 `
+            -SolutionName "${{ inputs.solution_name }}" `
+            -AppName "${{ inputs.app_name }}" `
+            -Configuration "${{ env.BUILD_CONFIGURATION }}" `
+            -Version "${{ steps.version.outputs.version }}"
+
+      - name: Package deployment artifacts
+        id: package
+        shell: pwsh
+        run: |
+          ./.github/scripts/package-deployment-artifacts.ps1 `
+            -AppName "${{ inputs.app_name }}" `
+            -WebName "${{ inputs.web_name }}" `
+            -ApiName "${{ inputs.api_name }}" `
+            -Version "${{ steps.version.outputs.version }}" `
+            -DeployDir "${{ env.DEPLOY_DIR }}" `
+            -TempDir "${{ env.PACKAGE_TEMP_DIR }}" `
+            -WebOnly:$${{ inputs.web_only }}
+
+      - name: Publish deployment artifacts
+        id: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "${{ inputs.app_name }} Package v${{ steps.version.outputs.version }}"
+          tag_name: "${{ steps.version.outputs.release-tag }}"
+          files: ${{ github.workspace }}\${{ steps.package.outputs.package-path }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Cleanup temporary files
+        if: always()
+        shell: pwsh
+        run: |
+          ./.github/scripts/cleanup-temp-files -TempDir "${{ env.PACKAGE_TEMP_DIR }}"
+
+      - name: Generate build summary
+        shell: pwsh
+        run: |
+          ./.github/scripts/write-summary.ps1 `
+            -AppName "${{ inputs.app_name }}" `
+            -Version "${{ steps.version.outputs.version }}" `
+            -ReleaseTag "${{ steps.version.outputs.release-tag }}" `
+            -Repository "${{ github.repository }}" `
+            -Branch "${{ github.ref_name }}" `
+            -Actor "${{ github.actor }}" `
+            -RunNumber ${{ github.run_number }} `
+            -Configuration "${{ env.BUILD_CONFIGURATION }}" `
+            -WebOnly:$${{ inputs.web_only }}
+
+  notify:
+    name: Send Build Notifications
+    runs-on: ubuntu-latest
+    needs: build
+    if: false 
+    
+    steps:
+      - name: Checkout for notification actions
+        uses: actions/checkout@v4
+      
+      - name: Send notifications
+        uses: ./.github/actions/notify-email
+        with:
+          build_result: ${{ needs.build.result }}
+          app_name: ${{ inputs.app_name }}
+          version: ${{ needs.build.outputs.version }}
+          release_tag: ${{ needs.build.outputs.release_tag }}
+          package_url: ${{ needs.build.outputs.package_url }}
+          branch: ${{ github.ref_name }}
+          actor: ${{ github.actor }}
+          run_number: ${{ github.run_number }}
+          repository: ${{ github.repository }}
+          run_id: ${{ github.run_id }}
+          email_username: ${{ secrets.EMAIL_USERNAME }}
+          email_password: ${{ secrets.EMAIL_PASSWORD }}
+          email_recipients: ${{ secrets.EMAIL_RECIPIENTS }}
+          teams_webhook_url: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          commit_timestamp: ${{ github.event.head_commit.timestamp }}

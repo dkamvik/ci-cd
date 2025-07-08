@@ -1,0 +1,93 @@
+name: 'Send Build Notifications'
+description: 'Sends email and Teams notifications for build results'
+author: 'DevOps Team'
+
+inputs:
+  build_result:
+    description: 'Build result status (success/failure)'
+    required: true
+  app_name:
+    description: 'Application name'
+    required: true
+  version:
+    description: 'Build version'
+    required: true
+  release_tag:
+    description: 'Release tag'
+    required: true
+  package_url:
+    description: 'Package download URL'
+    required: false
+  branch:
+    description: 'Git branch'
+    required: true
+  actor:
+    description: 'User who triggered the build'
+    required: true
+  run_number:
+    description: 'GitHub Actions run number'
+    required: true
+  repository:
+    description: 'GitHub repository'
+    required: true
+  run_id:
+    description: 'GitHub Actions run ID'
+    required: true
+  email_username:
+    description: 'SMTP username'
+    required: true
+  email_password:
+    description: 'SMTP password'
+    required: true
+  email_recipients:
+    description: 'Email recipients'
+    required: true
+  teams_webhook_url:
+    description: 'Teams webhook URL'
+    required: false
+  commit_timestamp:
+    description: 'Commit timestamp'
+    required: false
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Prepare notification data
+      id: notification-data
+      shell: pwsh
+      run: |
+        ${{ github.action_path }}/scripts/prepare-notification.ps1 `
+          -BuildResult "${{ inputs.build_result }}" `
+          -AppName "${{ inputs.app_name }}" `
+          -Version "${{ inputs.version }}" `
+          -ReleaseTag "${{ inputs.release_tag }}" `
+          -PackageUrl "${{ inputs.package_url }}" `
+          -Branch "${{ inputs.branch }}" `
+          -Actor "${{ inputs.actor }}" `
+          -RunNumber "${{ inputs.run_number }}" `
+          -Repository "${{ inputs.repository }}" `
+          -RunId "${{ inputs.run_id }}"
+
+    - name: Send email notification
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 587
+        username: ${{ inputs.email_username }}
+        password: ${{ inputs.email_password }}
+        subject: "Build ${{ steps.notification-data.outputs.status-text }}: ${{ inputs.app_name }} v${{ inputs.version }}"
+        to: ${{ inputs.email_recipients }}
+        from: "CI/CD Pipeline <${{ inputs.email_username }}>"
+        html_body: |
+          ${{ steps.notification-data.outputs.email-html }}
+        body: |
+          ${{ steps.notification-data.outputs.email-text }}
+
+
+    - name: Log notification status
+      shell: pwsh
+      run: |
+        ${{ github.action_path }}/scripts/Write-NotificationStatus.ps1 `
+          -BuildResult "${{ inputs.build_result }}" `
+          -AppName "${{ inputs.app_name }}" `
+          -Version "${{ inputs.version }}"

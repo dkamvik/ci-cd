@@ -1,0 +1,36 @@
+name: 'Custom Checkout with Full History'
+description: 'A wrapper action that checks out the repository with fetch-depth: 0 by default, using actions/checkout@v4.'
+
+inputs:
+  repository:
+    description: 'Repository name with owner. '
+    required: false
+    default: ${{ github.repository }}
+  ref:
+    description: 'The branch, tag or SHA to checkout. When checking out a pull request, it checks out the HEAD ref of the pull request in the context of the base repository. For example, pull/1/merge for a pull request merge commit or pull/1/head for a pull request head commit. If unset, the event-defined default will be used.'
+    required: false
+    default: '' 
+  token:
+    description: 'Token for the repository. Can be a GITHUB_TOKEN or a Personal Access Token.'
+    required: false
+    default: ${{ github.token }}
+  path:
+    description: 'Path to check out repository to. Default is $GITHUB_WORKSPACE.'
+    required: false 
+  clean:
+    description: 'Whether to clean the repository. Default is true.'
+    required: false
+    default: 'true'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Perform actions/checkout with fixed fetch-depth
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.ref }}
+        token: ${{ inputs.token }}
+        path: ${{ inputs.path }}      
+        clean: ${{ inputs.clean }}
+        fetch-depth: 0 
